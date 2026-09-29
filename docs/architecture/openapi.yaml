@@ -1,0 +1,408 @@
+openapi: 3.0.3
+info:
+  title: TaskVault Sync API
+  version: 0.1.0
+  description: >
+    Локально-первый планировщик. Коллекции проектов и задач — удобный CRUD.
+    Канонический канал офлайн-синхронизации — /v1/sync.
+servers:
+  - url: https://api.taskvault.example/v1
+    description: целевой контур (лабораторный паспорт)
+tags:
+  - name: auth
+  - name: sync
+  - name: projects
+  - name: tasks
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Выдать access и refresh JWT, зарегистрировать устройство
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Пара токенов и идентификатор устройства
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          description: Неверный логин или пароль
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Обновить access-токен
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: Новая пара токенов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          description: Refresh отозван или истёк
+
+  /sync:
+    get:
+      tags: [sync]
+      summary: Получить дельту после sync_token
+      parameters:
+        - in: query
+          name: sync_token
+          schema:
+            type: string
+            format: uuid
+          required: true
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Изменения и новый курсор
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncResponse"
+    post:
+      tags: [sync]
+      summary: Применить пачку идемпотентных команд из outbox клиента
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SyncRequest"
+      responses:
+        "200":
+          description: Принятые команды, конфликты, новый sync_token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncResponse"
+        "409":
+          description: Конфликт версий, см. conflicts
+
+  /projects:
+    get:
+      tags: [projects]
+      summary: Список проектов текущего пользователя
+      responses:
+        "200":
+          description: Проекты
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Project"
+    post:
+      tags: [projects]
+      summary: Создать проект (онлайн-сценарий; офлайн идёт через /sync)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectWrite"
+      responses:
+        "201":
+          description: Создан
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+
+  /tasks:
+    get:
+      tags: [tasks]
+      summary: Список задач (фильтр по проекту)
+      parameters:
+        - in: query
+          name: project_id
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Задачи
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Task"
+    post:
+      tags: [tasks]
+      summary: Создать задачу онлайн
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskWrite"
+      responses:
+        "201":
+          description: Создана
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+
+  /tasks/{id}:
+    patch:
+      tags: [tasks]
+      summary: Частичное обновление задачи
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskPatch"
+      responses:
+        "200":
+          description: Обновлена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "404":
+          description: Нет такой задачи
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [email, password, device_name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        device_name:
+          type: string
+          example: Pixel 8
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, device_id, expires_in]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        device_id:
+          type: string
+          format: uuid
+        expires_in:
+          type: integer
+          example: 900
+
+    Command:
+      type: object
+      required: [uuid, type, payload]
+      properties:
+        uuid:
+          type: string
+          format: uuid
+          description: Идемпотентный ключ из outbox клиента
+        type:
+          type: string
+          enum: [project.upsert, task.upsert, task.complete, task.delete, label.upsert]
+        payload:
+          type: object
+          additionalProperties: true
+        client_clock:
+          type: integer
+          description: Монотонные тики клиента для LWW
+
+    SyncRequest:
+      type: object
+      required: [sync_token, commands]
+      properties:
+        sync_token:
+          type: string
+          format: uuid
+        commands:
+          type: array
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/Command"
+
+    Conflict:
+      type: object
+      required: [entity, id, reason]
+      properties:
+        entity:
+          type: string
+        id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+        server_updated_at:
+          type: string
+          format: date-time
+
+    SyncResponse:
+      type: object
+      required: [sync_token, projects, tasks, labels, conflicts]
+      properties:
+        sync_token:
+          type: string
+          format: uuid
+        projects:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Task"
+        labels:
+          type: array
+          items:
+            $ref: "#/components/schemas/Label"
+        conflicts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Conflict"
+
+    Project:
+      type: object
+      required: [id, name, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        color:
+          type: string
+        archived:
+          type: boolean
+          default: false
+        updated_at:
+          type: string
+          format: date-time
+
+    ProjectWrite:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        color:
+          type: string
+
+    Label:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+
+    Task:
+      type: object
+      required: [id, project_id, title, status, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        notes:
+          type: string
+        status:
+          type: string
+          enum: [open, completed]
+        due_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+
+    TaskWrite:
+      type: object
+      required: [project_id, title]
+      properties:
+        project_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        notes:
+          type: string
+        due_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    TaskPatch:
+      type: object
+      properties:
+        title:
+          type: string
+        notes:
+          type: string
+        status:
+          type: string
+          enum: [open, completed]
+        due_at:
+          type: string
+          format: date-time
+          nullable: true
+        project_id:
+          type: string
+          format: uuid
